@@ -1,0 +1,7 @@
+# Entorno virtual
+venv/
+__pycache__/
+.DS_Store
+
+# Archivos de caché de Streamlit
+.streamlit/

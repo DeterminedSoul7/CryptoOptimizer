@@ -6,14 +6,26 @@ import graphviz as gv
 import networkx as nx
 import pandas as pd
 import streamlit as st
+import time
 
 # =============================================================================
 # CONFIGURACIÓN (Optimizado para Streamlit y Parquet con fallback a CSV)
 # =============================================================================
-PARQUET_NODOS = "nodos.parquet"
-PARQUET_ARISTAS = "aristas.parquet"
+def obtener_version_actual():
+    """Calcula la versión activa (v1, v2 o v3) basada en bloques de 5 minutos."""
+    # 300 segundos = 5 minutos. Ciclo de 3 versiones (v1 -> v2 -> v3 -> v1)
+    bloque = int(time.time() // 300)
+    idx = (bloque % 3) + 1
+    return f"v{idx}"
+
+# Obtenemos la versión que corresponde al minuto actual
+version_activa = obtener_version_actual()
+
+PARQUET_NODOS = f"nodos_{version_activa}.parquet"
+PARQUET_ARISTAS = f"aristas_{version_activa}.parquet"
 PARQUET_CCXT = "dataset_ccxt_completo.parquet"
 
+# Fallbacks a CSV por seguridad si faltara algún parquet
 CSV_NODOS = PARQUET_NODOS if os.path.exists(PARQUET_NODOS) else "nodos.csv"
 CSV_ARISTAS = PARQUET_ARISTAS if os.path.exists(PARQUET_ARISTAS) else "aristas.csv"
 CSV_CCXT = PARQUET_CCXT if os.path.exists(PARQUET_CCXT) else "dataset_ccxt_completo.csv"
@@ -524,6 +536,11 @@ idx_cr_d = todas_monedas.index(def_cr_d)
 cr_d_input = st.sidebar.selectbox("Moneda de Destino", todas_monedas, index=idx_cr_d)
 
 ejecutar = st.sidebar.button("Optimizar Transferencia", type="primary", use_container_width=True)
+
+
+st.sidebar.markdown("---")
+st.sidebar.subheader(" Simulación en Tiempo Real")
+st.sidebar.info(f"Versión de Dataset Activa: **{version_activa.upper()}**\n\n*(Rota automáticamente cada 5 min)*")
 
 # Encabezado
 badge = '<span class="badge-pro">MODO PRO</span>' if es_pro else '<span class="badge-lite">MODO LITE</span>'
