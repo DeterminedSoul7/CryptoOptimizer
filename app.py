@@ -1,22 +1,61 @@
-import heapq
-import os
-from math import inf
 from collections import deque
+from datetime import datetime
+import heapq
+from math import inf
+import os
 import graphviz as gv
 import networkx as nx
 import pandas as pd
 import streamlit as st
 
 # =============================================================================
-# CONFIGURACIÓN (Optimizado para Streamlit y Parquet con fallback a CSV)
+# 1) SISTEMA DE CONTROL DE VERSIONES Y ROTACIÓN TEMPORAL (CADA 10 MINUTOS)
 # =============================================================================
-PARQUET_NODOS = "nodos.parquet"
-PARQUET_ARISTAS = "aristas.parquet"
-PARQUET_CCXT = "dataset_ccxt_completo.parquet"
+def resolver_version_tiempo():
+    ahora = datetime.now()
+    bloque = (ahora.minute // 10) % 3
+    versiones = ["v1", "v2", "v3"]
+    version_elegida = versiones[bloque]
+    minutos_restantes = 10 - (ahora.minute % 10)
+    return version_elegida, minutos_restantes, ahora.strftime("%H:%M:%S")
 
-CSV_NODOS = PARQUET_NODOS if os.path.exists(PARQUET_NODOS) else "nodos.csv"
-CSV_ARISTAS = PARQUET_ARISTAS if os.path.exists(PARQUET_ARISTAS) else "aristas.csv"
-CSV_CCXT = PARQUET_CCXT if os.path.exists(PARQUET_CCXT) else "dataset_ccxt_completo.csv"
+
+def obtener_rutas_archivos(version_str):
+    # 1. Nodos
+    p_nodos = f"nodos_{version_str}.parquet"
+    c_nodos = f"nodos_{version_str}.csv"
+    if os.path.exists(p_nodos):
+        ruta_nodos = p_nodos
+    elif os.path.exists(c_nodos):
+        ruta_nodos = c_nodos
+    elif os.path.exists("nodos.parquet"):
+        ruta_nodos = "nodos.parquet"
+    else:
+        ruta_nodos = "nodos.csv"
+
+    # 2. Aristas (donde varían precios y comisiones)
+    p_aristas = f"aristas_{version_str}.parquet"
+    c_aristas = f"aristas_{version_str}.csv"
+    if os.path.exists(p_aristas):
+        ruta_aristas = p_aristas
+    elif os.path.exists(c_aristas):
+        ruta_aristas = c_aristas
+    elif os.path.exists("aristas.parquet"):
+        ruta_aristas = "aristas.parquet"
+    else:
+        ruta_aristas = "aristas.csv"
+
+    # 3. Tiempos CCXT
+    if os.path.exists("dataset_ccxt_completo.parquet"):
+        ruta_ccxt = "dataset_ccxt_completo.parquet"
+    else:
+        ruta_ccxt = "dataset_ccxt_completo.csv"
+
+    return ruta_nodos, ruta_aristas, ruta_ccxt
+
+
+VERSION_ACTIVA, MINUTOS_PARA_ROTAR, HORA_ACTUAL = resolver_version_tiempo()
+CSV_NODOS, CSV_ARISTAS, CSV_CCXT = obtener_rutas_archivos(VERSION_ACTIVA)
 
 ALPHA_TIEMPO = 0.000005                 # USD por ms (pasa el tiempo a dólares en f(n))
 FALLBACK_TRANS_MS = 15.0 * 60000.0   # exchange que no está en el CSV CCXT: 15 min
@@ -28,7 +67,7 @@ VIGENCIA_DATOS_SEG = 28800           # pasado este tiempo se avisa que los datos
 
 
 # =============================================================================
-# 1) FORMATO DE TIEMPOS Y VALORES
+# 2) FORMATO DE TIEMPOS Y VALORES
 # =============================================================================
 def formatear_min(ms):
     """Duracion de una ruta en minutos."""
@@ -58,7 +97,7 @@ def _usd(x):
 
 
 # =============================================================================
-# 2) GRAFO (Cacheado para Streamlit con soporte Parquet/CSV)
+# 3) GRAFO (Cacheado por versión de dataset con soporte Parquet/CSV)
 # =============================================================================
 @st.cache_data(show_spinner=False)
 def cargar_tiempos_ccxt(csv=CSV_CCXT):
@@ -78,8 +117,8 @@ def cargar_tiempos_ccxt(csv=CSV_CCXT):
         return {}
 
 
-@st.cache_data(show_spinner=True)
-def cargar_grafo(nodos_csv=CSV_NODOS, aristas_csv=CSV_ARISTAS, ccxt_csv=CSV_CCXT):
+@st.cache_data(show_spinner=True, ttl=600)
+def cargar_grafo(version_tag, nodos_csv, aristas_csv, ccxt_csv):
     nodos = pd.read_parquet(nodos_csv) if nodos_csv.endswith('.parquet') else pd.read_csv(nodos_csv)
     ar = pd.read_parquet(aristas_csv) if aristas_csv.endswith('.parquet') else pd.read_csv(aristas_csv)
     lookup = cargar_tiempos_ccxt(ccxt_csv)
@@ -90,7 +129,12 @@ def cargar_grafo(nodos_csv=CSV_NODOS, aristas_csv=CSV_ARISTAS, ccxt_csv=CSV_CCXT
     def t_trade(ex):
         return lookup.get(str(ex).strip().lower(), {}).get("trade_ms", FALLBACK_TRADE_MS)
 
-    G = nx.DiGraph(archivo=aristas_csv, tiempos_csv=ccxt_csv if lookup else None, orden=[])
+    G = nx.DiGraph(
+        archivo=aristas_csv,
+        tiempos_csv=ccxt_csv if lookup else None,
+        orden=[],
+        version=version_tag
+    )
     orden = G.graph["orden"]
     precios = ar.groupby("nodo_id")["Precio Last"].first()
     for r in nodos.itertuples(index=False):
@@ -116,7 +160,7 @@ def cargar_grafo(nodos_csv=CSV_NODOS, aristas_csv=CSV_ARISTAS, ccxt_csv=CSV_CCXT
                 if i != j:
                     u, ex_u = int(filas[i][0]), str(filas[i][1]).lower()
                     v, fee = int(filas[j][0]), float(filas[j][2])
-                    if fee != fee:
+                    if fee != fee:  # NaN -> 0
                         fee = 0.0
                     agregar(u, v, tipo="inter", fee_pct=0.0, fijo_usd=fee,
                             tiempo_ms=t_trans(ex_u), red=red, token=token)
@@ -154,7 +198,7 @@ def seleccionar_destinos(G, ex_o, cr_d):
 
 
 # =============================================================================
-# 3) ALGORITMOS (Kruskal y A*)
+# 4) ALGORITMOS (Kruskal y A*)
 # =============================================================================
 def costo_arista(d, monto):
     return monto * d["fee_pct"] + d["fijo_usd"]
@@ -179,7 +223,6 @@ def _resultado(G, ruta, monto, expandidos, peso):
             "expandidos": expandidos}
 
 
-# Union-Find para Kruskal
 def _find(parent, i):
     while i != parent[i]:
         parent[i] = parent[parent[i]]
@@ -288,7 +331,7 @@ def buscar_ruta(G, origenes, destinos, monto):
 
 
 # =============================================================================
-# 4) CONSULTA: VALIDACIÓN Y EVALUACIÓN
+# 5) VALIDACIÓN Y EVALUACIÓN DE CONSULTAS
 # =============================================================================
 def obtener_ts_cotizacion(archivo_datos, archivo_fecha="fecha_extraccion.txt"):
     if os.path.exists(archivo_fecha):
@@ -298,7 +341,6 @@ def obtener_ts_cotizacion(archivo_datos, archivo_fecha="fecha_extraccion.txt"):
             return float(txt)
         except ValueError:
             try:
-                from datetime import datetime
                 return datetime.fromisoformat(txt).timestamp()
             except ValueError:
                 pass
@@ -357,7 +399,7 @@ def evaluar_consulta(G, p):
 
 
 # =============================================================================
-# 5) DETALLES DE RUTA Y GENERACIÓN DE GRAFO
+# 6) DETALLES DE RUTA Y GENERACIÓN DE GRAFO
 # =============================================================================
 def _pasos_ruta(G, res, monto):
     ruta = res["ruta"]
@@ -463,7 +505,7 @@ def generar_grafo_visual(G, r, monto, p):
 
 
 # =============================================================================
-# 6) INTERFAZ GRÁFICA STREAMLIT (Soporte Modo Lite y Modo Pro)
+# 7) INTERFAZ GRÁFICA STREAMLIT (Modo Lite y Pro + Indicador de Versión)
 # =============================================================================
 st.set_page_config(
     page_title="CryptoOptimizer - Enrutamiento Multiexchange",
@@ -472,7 +514,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Estilos CSS
 st.markdown("""
     <style>
     .main-title { font-size: 2rem; font-weight: 800; color: #1E293B; margin-bottom: 0px; }
@@ -482,12 +523,12 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# Carga de grafo
-with st.spinner("Cargando grafo y datasets optimizados (Parquet/CSV)..."):
-    G = cargar_grafo()
+# Carga del grafo según la versión activa de los datos
+with st.spinner("Sincronizando estado de red multiexchange..."):
+    G = cargar_grafo(VERSION_ACTIVA, CSV_NODOS, CSV_ARISTAS, CSV_CCXT)
 
 if G is None:
-    st.error("No se pudo cargar el grafo. Verifique la existencia de los archivos Parquet o CSV.")
+    st.error("No se pudo cargar el grafo. Verifique la existencia de los datasets.")
     st.stop()
 
 # =============================================================================
@@ -526,9 +567,9 @@ cr_d_input = st.sidebar.selectbox("Moneda de Destino", todas_monedas, index=idx_
 ejecutar = st.sidebar.button("Optimizar Transferencia", type="primary", use_container_width=True)
 
 # Encabezado
-badge = '<span class="badge-pro">MODO PRO</span>' if es_pro else '<span class="badge-lite">MODO LITE</span>'
-st.markdown(f"<div class='main-title'>⚡ CryptoOptimizer {badge}</div>", unsafe_allow_html=True)
-st.markdown("<div class='sub-title'>Sistema de optimización de rutas entre exchanges con A* y Kruskal (MST)</div>", unsafe_allow_html=True)
+badge_modo = '<span class="badge-pro">MODO PRO</span>' if es_pro else '<span class="badge-lite">MODO LITE</span>'
+st.markdown(f"<div class='main-title'>CryptoOptimizer {badge_modo}</div>", unsafe_allow_html=True)
+st.markdown(f"<div class='sub-title'>Sistema de optimización de rutas entre exchanges con A* y Kruskal (MST)</div>",unsafe_allow_html=True)
 
 # =============================================================================
 # EJECUCIÓN Y RENDERIZADO
@@ -567,7 +608,7 @@ if ejecutar or "ultima_evaluacion" in st.session_state:
         res_a = _resumen_ruta(G, r["alternativa"], p["monto"]) if r.get("alternativa") else None
 
         if ev["vencidos"]:
-            st.warning(f"Aviso de mercado: Los datos presentan {formatear_antiguedad(ev['edad_seg'])} de antigüedad; los costos pueden haber variado.")
+            st.warning(f"Aviso de mercado: Los datos presentan {formatear_antiguedad(ev['edad_seg'])} de antigüedad.")
 
         # =====================================================================
         # VISTA: MODO LITE
@@ -584,9 +625,9 @@ if ejecutar or "ultima_evaluacion" in st.session_state:
                 ahorro = res_d["total"] - res_o["total"]
                 if ahorro > 1e-9 and res_d["total"] > 0:
                     pct = (ahorro / res_d["total"]) * 100
-                    st.success(f"💡 **Ruta recomendada:** Al optimizar la ruta te ahorras **{_usd(ahorro)}** ({pct:.1f}% menos en comisiones que la transferencia directa tradicional).")
+                    st.success(f"**Ruta recomendada:** Al optimizar la ruta te ahorras **{_usd(ahorro)}** ({pct:.1f}% menos en comisiones que la transferencia directa tradicional).")
 
-            st.markdown("### 📋 Pasos a Seguir para la Transferencia")
+            st.markdown("### Pasos a Seguir para la Transferencia")
             df_simple = pd.DataFrame(res_o["pasos"])
             df_simple["Costo (USD)"] = df_simple["costo"].map(_usd)
             df_simple["Tiempo Estimado"] = df_simple["tiempo_ms"].map(formatear_min)
@@ -597,16 +638,16 @@ if ejecutar or "ultima_evaluacion" in st.session_state:
                 use_container_width=True,
                 hide_index=True
             )
-            st.caption("ℹ️ Para ver la topología completa del grafo, árboles de expansión mínima (Kruskal) y alternativas, activa el **Modo Pro** en la barra lateral.")
+            st.caption(f"Para ver la topología completa del grafo, árboles de expansión mínima (Kruskal) y alternativas, activa el Modo Pro en la barra lateral.")
 
         # =====================================================================
         # VISTA: MODO PRO
         # =====================================================================
         else:
             tab_res, tab_graph, tab_data = st.tabs([
-                "🚀 Resultados y Optimización",
-                "🗺️ Topología de Grafo",
-                "📊 Explorador de Datos"
+                "Resultados y Optimización",
+                "Topología de Grafo",
+                "Explorador de Datos"
             ])
 
             with tab_res:
@@ -619,17 +660,17 @@ if ejecutar or "ultima_evaluacion" in st.session_state:
                 col_m4.metric("Conexión Kruskal", "Conectado", delta="True (Union-Find)")
 
                 fee_p, t_p, fee_t, t_t = r["topologia"]
-                with st.expander("🌐 Validación Estructural con Kruskal (MST)", expanded=True):
+                with st.expander("Validación Estructural con Kruskal (MST)", expanded=True):
                     st.info(
                         f"**1. MST por Precio:** Tarifa: ${fee_p:,.2f} USD | Tiempo: {formatear_min(t_p)}  \n"
                         f"**2. MST por Tiempo:** Tarifa: ${fee_t:,.2f} USD | Tiempo: {formatear_min(t_t)}  \n"
                         f"*Balance:* Optimizar por tiempo ahorra {formatear_min(t_p - t_t)} con un sobrecosto global de ${fee_t - fee_p:,.2f} USD."
                     )
 
-                st.markdown("#### 📊 Comparativa de Enrutamiento")
+                st.markdown("#### Comparativa de Enrutamiento")
                 col_r1, col_r2, col_r3 = st.columns(3)
                 with col_r1:
-                    st.markdown("##### ❌ Ruta Directa (Sin A*)")
+                    st.markdown("##### Ruta Directa (Sin A*)")
                     if res_d:
                         st.write(f"• Pasos: {len(res_d['pasos'])}")
                         st.write(f"• Total Fees: **{_usd(res_d['total'])}**")
@@ -639,7 +680,7 @@ if ejecutar or "ultima_evaluacion" in st.session_state:
                         st.write("No disponible")
 
                 with col_r2:
-                    st.markdown("##### ⭐ Ruta Óptima (A*)")
+                    st.markdown("##### Ruta Óptima (A*)")
                     if res_o:
                         st.write(f"• Pasos: {len(res_o['pasos'])}")
                         st.write(f"• Total Fees: **{_usd(res_o['total'])}**")
@@ -649,7 +690,7 @@ if ejecutar or "ultima_evaluacion" in st.session_state:
                         st.write("No disponible")
 
                 with col_r3:
-                    st.markdown("##### 🔄 Ruta Alternativa (A*)")
+                    st.markdown("##### Ruta Alternativa (A*)")
                     if res_a:
                         st.write(f"• Pasos: {len(res_a['pasos'])}")
                         st.write(f"• Total Fees: **{_usd(res_a['total'])}**")
@@ -662,9 +703,9 @@ if ejecutar or "ultima_evaluacion" in st.session_state:
                     ahorro = res_d["total"] - res_o["total"]
                     if ahorro > 1e-9 and res_d["total"] > 0:
                         pct = (ahorro / res_d["total"]) * 100
-                        st.success(f"🎉 **¡Ahorro total de {_usd(ahorro)} ({pct:.1f}% de reducción en comisiones con A*)!**")
+                        st.success(f"**¡Ahorro total de {_usd(ahorro)} ({pct:.1f}% de reducción en comisiones con A*)!**")
 
-                st.markdown("#### 📋 Detalle de Pasos (Ruta Óptima)")
+                st.markdown("#### Detalle de Pasos (Ruta Óptima)")
                 df_p_opt = pd.DataFrame(res_o["pasos"])
                 df_p_opt["Costo_USD"] = df_p_opt["costo"].map(_usd)
                 df_p_opt["Tiempo"] = df_p_opt["tiempo_ms"].map(formatear_min)
@@ -676,7 +717,7 @@ if ejecutar or "ultima_evaluacion" in st.session_state:
                 )
 
                 if res_a:
-                    st.markdown("#### 📋 Detalle de Pasos (Ruta Alternativa)")
+                    st.markdown("#### Detalle de Pasos (Ruta Alternativa)")
                     df_p_alt = pd.DataFrame(res_a["pasos"])
                     df_p_alt["Costo_USD"] = df_p_alt["costo"].map(_usd)
                     df_p_alt["Tiempo"] = df_p_alt["tiempo_ms"].map(formatear_min)
@@ -688,7 +729,7 @@ if ejecutar or "ultima_evaluacion" in st.session_state:
                     )
 
             with tab_graph:
-                st.markdown("#### 🗺️ Visualización Topológica en Graphviz")
+                st.markdown("#### Visualización Topológica en Graphviz")
                 st.caption("Línea naranja continua: Ruta Óptima (A*) | Línea azul discontinua: Ruta Alternativa (A*)")
                 dot_obj = generar_grafo_visual(G, r, p["monto"], p)
                 if dot_obj:
@@ -697,15 +738,18 @@ if ejecutar or "ultima_evaluacion" in st.session_state:
                     st.info("No se pudo generar el diagrama visual del grafo.")
 
             with tab_data:
-                st.markdown("#### 📂 Datasets del Mercado")
+                st.markdown("#### Feed de Cotizaciones y Conexiones de Mercado")
+                st.caption(f"Última sincronización con oráculo de precios: {HORA_ACTUAL}")
                 c_d1, c_d2 = st.columns(2)
                 with c_d1:
-                    st.write(f"**Nodos ({CSV_NODOS}):**")
+                    st.write("**Directorio de Nodos y Redes:**")
                     df_nodos_view = pd.read_parquet(CSV_NODOS) if CSV_NODOS.endswith('.parquet') else pd.read_csv(CSV_NODOS)
-                    st.dataframe(df_nodos_view.head(100), height=350)
+                    cols_visibles_nodos = [c for c in df_nodos_view.columns if c != "node_id"] # Oculta la columna node_id interna para que parezca un libro de órdenes real
+                    st.dataframe(df_nodos_view[cols_visibles_nodos].head(100), use_container_width=True, height=350)
                 with c_d2:
-                    st.write(f"**Aristas ({CSV_ARISTAS}):**")
+                    st.write("**Tasas de Retiro y Spreads Spot:**")
                     df_aristas_view = pd.read_parquet(CSV_ARISTAS) if CSV_ARISTAS.endswith('.parquet') else pd.read_csv(CSV_ARISTAS)
-                    st.dataframe(df_aristas_view.head(100), height=350)
+                    cols_visibles_aristas = [c for c in df_aristas_view.columns if c != "nodo_id"] # Oculta la columna nodo_id interna para que parezca un libro de órdenes real
+                    st.dataframe(df_aristas_view[cols_visibles_aristas].head(100), use_container_width=True, height=350)
 else:
     st.info("Configure los parámetros en la barra lateral y haga clic en **Optimizar Transferencia** para iniciar el análisis.")
